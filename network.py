@@ -161,6 +161,7 @@ class P2PNode:
                 if not data:
                     break
                 message = json.loads(data.decode())
+                print(f"Received bytes from {addr}: {message}")
                 await self.process_message(message, addr, writer)
             except Exception as e:
                 print(f"Error reading from {addr}: {e}")
