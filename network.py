@@ -1,10 +1,11 @@
 import asyncio
 import json
 import hashlib
+import base64
 from typing import List, Tuple, Dict
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import x25519, ed25519
-from crypto import DoubleRatchet
+from crypto import DoubleRatchet  # Using the improved version
 from blockchain import Block, Blockchain
 
 class P2PNode:
@@ -18,7 +19,7 @@ class P2PNode:
         self.running = False
         self.server = None
         
-        self.blockchain = Blockchain()  # Replace List[Block] with Blockchain
+        self.blockchain = Blockchain()
         self.pending_messages: List[Dict] = []
         self.seen_messages: set = set()
 
@@ -156,7 +157,7 @@ class P2PNode:
     async def handle_reader(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, addr: Tuple[str, int]):
         while self.running:
             try:
-                data = await reader.read(1024)
+                data = await reader.read(4096)  # Increased buffer size for larger messages
                 if not data:
                     break
                 message = json.loads(data.decode())
@@ -181,6 +182,8 @@ class P2PNode:
             if peer not in self.peers and len(self.peers) < self.max_peers and peer != (self.host, self.port):
                 self.peers.append(peer)
                 self.known_peers.add(peer)
+            
+            # Process peer's X25519 public key
             their_x25519_pub = x25519.X25519PublicKey.from_public_bytes(
                 bytes.fromhex(message["pub_key"])
             )
@@ -189,11 +192,15 @@ class P2PNode:
             self.peer_addresses[peer] = peer_address
             self.update_routing_table(peer, peer_address)
             self.dht_store[peer_address] = peer
+            
+            # Generate shared secret using X3DH (extended triple DH)
             shared_secret = self.x25519_priv.exchange(their_x25519_pub)
+            
+            # Initialize Double Ratchet with the shared secret
             if peer_address not in self.ratchets:
-                self.ratchets[peer_address] = DoubleRatchet()
-                self.ratchets[peer_address].root_key = shared_secret  # Use X25519 shared secret directly
-                self.ratchets[peer_address].chain_key = self.ratchets[peer_address].kdf(shared_secret)
+                self.ratchets[peer_address] = DoubleRatchet(shared_secret=shared_secret)
+            
+            # Respond with our public key
             pub_key = self.x25519_pub.public_bytes(
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw
@@ -232,18 +239,25 @@ class P2PNode:
                 })
 
         elif msg_type == "NEW_MESSAGE":
+            # Extract message components
             sender_addr = message["sender_addr"]
             recipient_addr = message["recipient_addr"]
-            enc_msg = message["enc_msg"]
+            encrypted_msg = message["encrypted_msg"]
             sig = bytes.fromhex(message["sig"])
+            
             try:
+                # Verify message signature using the sender's Ed25519 key
                 sender_pub_key = ed25519.Ed25519PublicKey.from_public_bytes(bytes.fromhex(sender_addr))
-                sender_pub_key.verify(sig, f"{sender_addr}{recipient_addr}{enc_msg}".encode())
+                # Create signature data that includes all the necessary components
+                sig_data = f"{sender_addr}{recipient_addr}{json.dumps(encrypted_msg)}".encode()
+                sender_pub_key.verify(sig, sig_data)
+                
+                # Process verified message
                 if message not in self.pending_messages:
                     self.pending_messages.append({
                         "sender_addr": sender_addr,
                         "recipient_addr": recipient_addr,
-                        "enc_msg": enc_msg,
+                        "encrypted_msg": encrypted_msg,
                         "sig": message["sig"]
                     })
                     print(f"Verified message from {sender_addr} to {recipient_addr}")
@@ -300,43 +314,77 @@ class P2PNode:
             await asyncio.sleep(1)
 
     def get_messages(self, public_address: str) -> List[str]:
+        """Retrieve and decrypt messages for a given address"""
         messages = []
         for msg in self.blockchain.get_messages_for_address(public_address):
             sender_addr = msg["sender_addr"]
             if sender_addr not in self.ratchets:
                 print(f"No ratchet for sender {sender_addr}. Skipping message.")
                 continue
+            
             ratchet = self.ratchets[sender_addr]
             try:
-                plaintext = ratchet.decrypt_message(bytes.fromhex(msg["enc_msg"]))
-                messages.append(plaintext.decode())
+                # Get the encrypted message dictionary
+                encrypted_msg = msg["encrypted_msg"]
+                
+                # Deserialize the message parts from JSON to bytes where needed
+                msg_dict = {
+                    'dh_public': bytes.fromhex(encrypted_msg['dh_public']),
+                    'counter': encrypted_msg['counter'],
+                    'nonce': bytes.fromhex(encrypted_msg['nonce']),
+                    'tag': bytes.fromhex(encrypted_msg['tag']),
+                    'ciphertext': bytes.fromhex(encrypted_msg['ciphertext'])
+                }
+                
+                # Decrypt the message
+                plaintext = ratchet.decrypt_message(msg_dict)
+                if plaintext:
+                    messages.append(plaintext.decode())
+                else:
+                    print(f"Could not decrypt message from {sender_addr}")
             except Exception as e:
                 print(f"Failed to decrypt message from {sender_addr}: {e}")
+        
         return messages
 
     async def send_chat(self, recipient_address: str, message: str):
+        """Send an encrypted chat message to a recipient"""
+        # Find the recipient in the network
         recipient_peer = await self.find_node(recipient_address)
         if not recipient_peer:
             print(f"Recipient {recipient_address} not found in network")
             return
         
+        # Ensure we have a ratchet for this recipient
         if recipient_address not in self.ratchets:
             print(f"No ratchet initialized for {recipient_address}. Ensure key exchange completed.")
             return
         
+        # Encrypt the message
         ratchet = self.ratchets[recipient_address]
-        enc_msg = ratchet.encrypt_message(message.encode()).hex()
-        ratchet.ratchet_step()
-
-        msg_data = f"{self.public_address}{recipient_address}{enc_msg}"
-        sig = self.ed25519_priv.sign(msg_data.encode()).hex()
-
+        encrypted_msg = ratchet.encrypt_message(message.encode())
+        
+        # Convert binary data to hex strings for JSON serialization
+        serialized_msg = {
+            'dh_public': encrypted_msg['dh_public'].hex(),
+            'counter': encrypted_msg['counter'],
+            'nonce': encrypted_msg['nonce'].hex(),
+            'tag': encrypted_msg['tag'].hex(),
+            'ciphertext': encrypted_msg['ciphertext'].hex()
+        }
+        
+        # Create message signature
+        sig_data = f"{self.public_address}{recipient_address}{json.dumps(serialized_msg)}".encode()
+        sig = self.ed25519_priv.sign(sig_data).hex()
+        
+        # Prepare the message packet
         msg = {
             "type": "NEW_MESSAGE",
             "sender_addr": self.public_address,
             "recipient_addr": recipient_address,
-            "enc_msg": enc_msg,
+            "encrypted_msg": serialized_msg,
             "sig": sig
         }
+        
         print(f"Sending chat to {recipient_address}: {message}")
         await self.broadcast_message(msg)
