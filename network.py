@@ -188,6 +188,7 @@ class P2PNode:
             their_x25519_pub = x25519.X25519PublicKey.from_public_bytes(
                 bytes.fromhex(message["pub_key"])
             )
+            print(f"their public key: {message['pub_key']}")
             self.peer_public_keys[peer] = their_x25519_pub
             peer_address = message["address"]
             self.peer_addresses[peer] = peer_address
@@ -198,8 +199,9 @@ class P2PNode:
             shared_secret = self.x25519_priv.exchange(their_x25519_pub)
             
             # Initialize Double Ratchet with the shared secret
-            if peer_address not in self.ratchets:
-                self.ratchets[peer_address] = DoubleRatchet(shared_secret=shared_secret)
+            ratchet = DoubleRatchet(shared_secret=shared_secret)
+            ratchet.ratchet_dh_step(their_x25519_pub)  # Use peer's X25519 key to start ratchet
+            self.ratchets[peer_address] = ratchet
             
             # Respond with our public key
             pub_key = self.x25519_pub.public_bytes(

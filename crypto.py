@@ -2,6 +2,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.hmac import HMAC
 import os
 import struct
 
@@ -57,15 +58,15 @@ class DoubleRatchet:
         return output[:32], output[32:]  # New root_key, new chain_key
     
     def kdf_ck(self, chain_key):
-        """Key derivation for chain keys to message keys"""
-        hmac = hashes.Hash(hashes.HMAC(hashes.SHA256()))
-        hmac.update(chain_key)
-        hmac.update(b'\x01')  # Different input for message key
+        """Key derivation for chain keys to message keys using HMAC"""
+        # HMAC for message key
+        hmac = HMAC(chain_key, hashes.SHA256())
+        hmac.update(b'\x01')
         message_key = hmac.finalize()
         
-        hmac = hashes.Hash(hashes.HMAC(hashes.SHA256()))
-        hmac.update(chain_key)
-        hmac.update(b'\x02')  # Different input for next chain key
+        # HMAC for next chain key
+        hmac = HMAC(chain_key, hashes.SHA256())
+        hmac.update(b'\x02')
         next_chain_key = hmac.finalize()
         
         return next_chain_key, message_key
